@@ -1,0 +1,7 @@
+\input texinfo
+
+@deftypefn {Mapping Function} {} log2 (@var{x})
+@deftypefnx {Mapping Function} {[@var{f}, @var{e}] =} log2 (@var{x})
+@end deftypefn
+
+@bye
