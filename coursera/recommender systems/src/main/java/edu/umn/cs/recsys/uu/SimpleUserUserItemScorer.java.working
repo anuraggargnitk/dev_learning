@@ -1,0 +1,149 @@
+package edu.umn.cs.recsys.uu;
+
+import java.util.AbstractMap;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.PriorityQueue;
+
+import javax.annotation.Nonnull;
+import javax.inject.Inject;
+
+import org.grouplens.lenskit.basic.AbstractItemScorer;
+import org.grouplens.lenskit.data.dao.ItemEventDAO;
+import org.grouplens.lenskit.data.dao.UserEventDAO;
+import org.grouplens.lenskit.data.event.Event;
+import org.grouplens.lenskit.data.event.Rating;
+import org.grouplens.lenskit.data.history.History;
+import org.grouplens.lenskit.data.history.RatingVectorUserHistorySummarizer;
+import org.grouplens.lenskit.data.history.UserHistory;
+import org.grouplens.lenskit.vectors.MutableSparseVector;
+import org.grouplens.lenskit.vectors.SparseVector;
+import org.grouplens.lenskit.vectors.VectorEntry;
+import org.grouplens.lenskit.vectors.similarity.CosineVectorSimilarity;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * User-user item scorer.
+ * 
+ * @author <a href="http://www.grouplens.org">GroupLens Research</a>
+ */
+public class SimpleUserUserItemScorer extends AbstractItemScorer {
+	private final UserEventDAO userDao;
+	private final ItemEventDAO itemDao;
+	private static final Logger logger = LoggerFactory
+			.getLogger("uu-assignment");
+
+	private static final int similarUserNum = 30;
+	
+	
+	@Inject
+	public SimpleUserUserItemScorer(UserEventDAO udao, ItemEventDAO idao) {
+		userDao = udao;
+		itemDao = idao;
+	}
+
+	@Override
+	public void score(long user, @Nonnull MutableSparseVector scores) {
+		SparseVector userVector = getUserRatingVector(user);
+		double userMean = userVector.mean();
+		// make a mutable copy of target user vector
+		MutableSparseVector targetUserVector = userVector.mutableCopy();
+		// subtract the user mean rating
+		targetUserVector.add(-1 * userMean);
+		// This is the loop structure to iterate over items to score
+		for (VectorEntry e : scores.fast(VectorEntry.State.EITHER)) {
+			long itemId = e.getKey();
+			// get all the users who rated this item
+			List<Event> itemRatings = itemDao.getEventsForItem(itemId);
+			if (itemRatings != null) {
+				// create a priority queue for storing 30 nearest neighbors of current user who rated current item
+				PriorityQueue<Map.Entry<SparseVector, Double>> nSimilarUsers = new PriorityQueue<Map.Entry<SparseVector, Double>>(
+						similarUserNum,
+						new Comparator<Map.Entry<SparseVector, Double>>() {
+
+							@Override
+							public int compare(Entry<SparseVector, Double> o1,
+									Entry<SparseVector, Double> o2) {
+								//needs more checks (like instanceOf etc)
+								return o1.getValue().compareTo(o2.getValue());
+							}
+						});
+
+				for (Event event : itemRatings) {
+					long userId = event.getUserId();
+					// skip the current user for computing similarity score
+					if (userId != user) {
+						SparseVector possibleNeighborVector = getUserRatingVector(userId);
+						double simUserMean = possibleNeighborVector.mean();
+						MutableSparseVector mutNeighborVector = possibleNeighborVector
+								.mutableCopy();
+						mutNeighborVector.add(-1 * simUserMean);
+						// compute the mean-centered cosine vector similarity b/w
+						// the current user and its possible nearest neighbor
+						double similarityValue = new CosineVectorSimilarity()
+								.similarity(targetUserVector,
+										mutNeighborVector);
+						// use mean-centered User vector to store into PQ
+						Map.Entry<SparseVector, Double> simUsrVal = new AbstractMap.SimpleEntry(
+								mutNeighborVector, similarityValue);
+						// get the head of min prioroty queue
+						Map.Entry<SparseVector, Double> minSimilarityVector = nSimilarUsers
+								.peek();
+						// if PQ is empty or if it has elements less than required neighbors
+						if (minSimilarityVector == null
+								|| nSimilarUsers.size() < similarUserNum) {
+							// blindly add the element to PQ
+							nSimilarUsers.add(simUsrVal);
+						} else if (Double
+								.compare(minSimilarityVector.getValue(),
+										similarityValue) == -1) {
+							//PQ already has 30 elements & if the head of PQ is less than current
+							//similarity value of user, replace it
+							nSimilarUsers.remove();
+							nSimilarUsers.add(simUsrVal);
+						}
+					}
+				}
+				double numerator = 0d;
+				double denominator = 0d;
+
+				// iterate over 30 nearest neighbors
+				for (Entry<SparseVector, Double> nearestNeighbor : nSimilarUsers) {
+					// its already mean-centered
+					SparseVector simUsrVector = nearestNeighbor.getKey();
+					double similarityVal = nearestNeighbor.getValue();
+					double simUsrMeanCentredRating = simUsrVector.get(itemId);
+					numerator = numerator + similarityVal
+							* simUsrMeanCentredRating;
+					denominator = denominator + Math.abs(similarityVal);
+				}
+				double userFinalScore = userMean + numerator / denominator;
+				/*
+				 * logger.info("Score for User Id-Item Id Pair {}:{} is {}",
+				 * user, itemId, userFinalScore);
+				 */
+				scores.set(itemId, userFinalScore);
+			}
+
+		}
+	}
+
+	/**
+	 * Get a user's rating vector.
+	 * 
+	 * @param user
+	 *            The user ID.
+	 * @return The rating vector.
+	 */
+	private SparseVector getUserRatingVector(long user) {
+		UserHistory<Rating> history = userDao.getEventsForUser(user,
+				Rating.class);
+		if (history == null) {
+			history = History.forUser(user);
+		}
+		return RatingVectorUserHistorySummarizer.makeRatingVector(history);
+	}
+}
